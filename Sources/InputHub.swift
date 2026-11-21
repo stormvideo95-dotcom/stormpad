@@ -18,6 +18,10 @@ final class InputHub {
     private var switchSpan: [Int: Double] = [:]        // axis index -> half range seen
     private var switchSeen = Date.distantPast
     private var reportBuffers: [String: UnsafeMutablePointer<UInt8>] = [:]
+    private var reportCounts: [String: Int] = [:]
+    private var lastRaw: String = ""
+    private var devInfo: [String: String] = [:]
+    private var lastElem: String = ""
     var switchActive: Bool { Date().timeIntervalSince(switchSeen) < 1.0 }
 
     init() {
@@ -62,6 +66,10 @@ final class InputHub {
     private func added(_ d: IOHIDDevice) {
         let name = IOHIDDeviceGetProperty(d, kIOHIDProductKey as CFString) as? String ?? "USB controller"
         hidNames[key(d)] = name
+        let vid = IOHIDDeviceGetProperty(d, kIOHIDVendorIDKey as CFString) as? Int ?? 0
+        let pid = IOHIDDeviceGetProperty(d, kIOHIDProductIDKey as CFString) as? Int ?? 0
+        let tr = IOHIDDeviceGetProperty(d, kIOHIDTransportKey as CFString) as? String ?? "?"
+        devInfo[key(d)] = String(format: "%@ vid=%04X pid=%04X %@", name, vid, pid, tr)
         let vendor = IOHIDDeviceGetProperty(d, kIOHIDVendorIDKey as CFString) as? Int ?? 0
         if vendor == 0x057E && reportBuffers[key(d)] == nil {
             let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 512)
@@ -78,6 +86,8 @@ final class InputHub {
 
     private func switchReport(_ id: UInt32, _ p: UnsafeMutablePointer<UInt8>, _ len: Int) {
         // Buffer may or may not start with the report id byte.
+        reportCounts[String(format: "0x%02X/len%d", id, len), default: 0] += 1
+        lastRaw = (0..<min(len, 14)).map { String(format: "%02X", p[$0]) }.joined(separator: " ")
         var o = 0
         if len > 0 && UInt32(p[0]) == id { o = 1 }
         guard id == 0x30 || id == 0x21, len - o >= 11 else { return }
@@ -138,6 +148,7 @@ final class InputHub {
         let usage = Int(IOHIDElementGetUsage(el))
         let dk = key(IOHIDElementGetDevice(el)) + "|"
         let v = IOHIDValueGetIntegerValue(value)
+        lastElem = "page=\(page) usage=\(usage) v=\(v)"
 
         if page == kHIDPage_Button {
             buttons[dk + "hid:Button \(usage)"] = v != 0
@@ -158,6 +169,30 @@ final class InputHub {
             let lo = Double(IOHIDElementGetLogicalMin(el)), hi = Double(IOHIDElementGetLogicalMax(el))
             guard hi > lo else { return }
             axes[dk + "hid:" + name] = (Double(v) - lo) / (hi - lo) * 2 - 1
+        }
+    }
+
+    func debugDump(active: Set<String>) {
+        var out = "---- \(Date())\n"
+        for c in GCController.controllers() {
+            out += "GC: \(c.vendorName ?? "?") cat=\(c.productCategory)\n"
+            for (n, d) in c.physicalInputProfile.dpads {
+                out += String(format: "  dpad %@ x=%.2f y=%.2f\n", n, d.xAxis.value, d.yAxis.value)
+            }
+        }
+        for (_, v) in devInfo { out += "HID: \(v)\n" }
+        out += "reports: \(reportCounts)\nlastRaw: \(lastRaw)\nlastElem: \(lastElem)\n"
+        out += "switchActive=\(switchActive) axes=\(switchAxes) centre=\(switchCenter)\n"
+        out += "active: \(active.sorted())\n"
+        reportCounts = [:]
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/StormPad.log")
+        if let data = out.data(using: .utf8) {
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile(); h.write(data); try? h.close()
+                if let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int, size > 2_000_000 {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            } else { try? data.write(to: url) }
         }
     }
 

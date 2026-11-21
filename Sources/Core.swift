@@ -65,6 +65,7 @@ final class Core: ObservableObject {
             if tr != self.trusted { self.trusted = tr }
             let names = self.hub.controllerNames
             if names != self.controllerNames { self.controllerNames = names }
+            self.hub.debugDump(active: self.activeInputs)
         }
         RunLoop.main.add(s, forMode: .common)
         slowTimer = s
