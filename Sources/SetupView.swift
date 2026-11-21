@@ -112,7 +112,11 @@ struct SetupView: View {
 
             GroupBox(label: Text("Settings").font(.headline)) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Toggle("Mapping on", isOn: $core.enabled)
+                    HStack {
+                        Toggle("Mapping on", isOn: $core.enabled)
+                        Spacer()
+                        Button("Re-center sticks") { core.hub.recenter() }
+                    }
                     Toggle("Holding a button repeats the key (good for typing, off for games)", isOn: $core.repeatKeys)
                     HStack {
                         Text("Stick sensitivity")

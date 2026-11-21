@@ -11,6 +11,14 @@ final class InputHub {
     private var axes: [String: Double] = [:]    // "dev|hid:Axis X" -> -1...1
     private var hats: [String: Int] = [:]       // "dev|hid:Hat" -> 0..7 or -1
     private var hidNames: [String: String] = [:]
+    // Raw Switch Pro (and clone) reports: sticks read directly + self-calibrated
+    private var switchButtons = Set<String>()
+    private var switchAxes: [String: Double] = [:]     // "sw:Left stick X" -> -1...1
+    private var switchCenter: [Int: Int] = [:]         // axis index -> raw centre
+    private var switchSpan: [Int: Double] = [:]        // axis index -> half range seen
+    private var switchSeen = Date.distantPast
+    private var reportBuffers: [String: UnsafeMutablePointer<UInt8>] = [:]
+    var switchActive: Bool { Date().timeIntervalSince(switchSeen) < 1.0 }
 
     init() {
         GCController.shouldMonitorBackgroundEvents = true
@@ -54,11 +62,57 @@ final class InputHub {
     private func added(_ d: IOHIDDevice) {
         let name = IOHIDDeviceGetProperty(d, kIOHIDProductKey as CFString) as? String ?? "USB controller"
         hidNames[key(d)] = name
+        let vendor = IOHIDDeviceGetProperty(d, kIOHIDVendorIDKey as CFString) as? Int ?? 0
+        if vendor == 0x057E && reportBuffers[key(d)] == nil {
+            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 512)
+            reportBuffers[key(d)] = buf
+            let ctx = Unmanaged.passUnretained(self).toOpaque()
+            IOHIDDeviceRegisterInputReportCallback(d, buf, 512, { ctx, _, _, _, reportID, report, length in
+                guard let ctx = ctx else { return }
+                Unmanaged<InputHub>.fromOpaque(ctx).takeUnretainedValue().switchReport(reportID, report, length)
+            }, ctx)
+        }
+    }
+
+    func recenter() { switchCenter.removeAll(); switchSpan.removeAll() }
+
+    private func switchReport(_ id: UInt32, _ p: UnsafeMutablePointer<UInt8>, _ len: Int) {
+        // Buffer may or may not start with the report id byte.
+        var o = 0
+        if len > 0 && UInt32(p[0]) == id { o = 1 }
+        guard id == 0x30 || id == 0x21, len - o >= 11 else { return }
+        let r = { (i: Int) -> Int in Int(p[o + i - 1]) }   // r(1)=timer ... same layout as docs (byte index after id)
+        let b3 = r(3), b4 = r(4), b5 = r(5)
+        var bt = Set<String>()
+        let add = { (on: Bool, n: String) in if on { bt.insert("sw:" + n) } }
+        add(b3 & 0x01 != 0, "Y"); add(b3 & 0x02 != 0, "X"); add(b3 & 0x04 != 0, "B"); add(b3 & 0x08 != 0, "A")
+        add(b3 & 0x40 != 0, "R"); add(b3 & 0x80 != 0, "ZR")
+        add(b4 & 0x01 != 0, "Minus"); add(b4 & 0x02 != 0, "Plus"); add(b4 & 0x04 != 0, "Right stick click")
+        add(b4 & 0x08 != 0, "Left stick click"); add(b4 & 0x10 != 0, "Home"); add(b4 & 0x20 != 0, "Capture")
+        add(b5 & 0x01 != 0, "D-pad ↓"); add(b5 & 0x02 != 0, "D-pad ↑"); add(b5 & 0x04 != 0, "D-pad →")
+        add(b5 & 0x08 != 0, "D-pad ←"); add(b5 & 0x40 != 0, "L"); add(b5 & 0x80 != 0, "ZL")
+        switchButtons = bt
+        let raw = [r(6) | ((r(7) & 0x0F) << 8), (r(7) >> 4) | (r(8) << 4),
+                   r(9) | ((r(10) & 0x0F) << 8), (r(10) >> 4) | (r(11) << 4)]
+        let names = ["Left stick X", "Left stick Y", "Right stick X", "Right stick Y"]
+        for i in 0..<4 {
+            let v = raw[i]
+            if switchCenter[i] == nil { switchCenter[i] = v }
+            let c = switchCenter[i]!
+            let span = max(switchSpan[i] ?? 0, Double(abs(v - c)), 900)
+            switchSpan[i] = span
+            var n = Double(v - c) / span
+            if i % 2 == 1 { n = -n }          // Switch: up is bigger -> make up negative like HID
+            switchAxes["sw:" + names[i]] = n
+        }
+        switchSeen = Date()
     }
 
     private func removed(_ d: IOHIDDevice) {
         let k = key(d) + "|"
         hidNames.removeValue(forKey: key(d))
+        if let b = reportBuffers.removeValue(forKey: key(d)) { _ = b }  // keep memory alive (callback may still fire)
+        if reportBuffers.isEmpty { switchButtons = []; switchAxes = [:]; recenter() }
         buttons = buttons.filter { !$0.key.hasPrefix(k) }
         axes = axes.filter { !$0.key.hasPrefix(k) }
         hats = hats.filter { !$0.key.hasPrefix(k) }
@@ -119,10 +173,19 @@ final class InputHub {
         for c in GCController.controllers() {
             let p = c.physicalInputProfile
             for (name, b) in p.buttons where b.isPressed { s.insert("gc:" + name) }
-            for (name, d) in p.dpads {
+            for (name, d) in p.dpads where !(switchActive && name.contains("Thumbstick")) {
                 let x = Double(d.xAxis.value), y = Double(d.yAxis.value)
                 if x > dz { s.insert("gc:\(name) →") } else if x < -dz { s.insert("gc:\(name) ←") }
                 if y > dz { s.insert("gc:\(name) ↑") } else if y < -dz { s.insert("gc:\(name) ↓") }
+            }
+        }
+        if switchActive {
+            s.formUnion(switchButtons)
+            for (id, v) in switchAxes {
+                let vertical = id.hasSuffix("Y")
+                let base = String(id.dropLast(2))
+                if v > dz { s.insert(base + (vertical ? " ↓" : " →")) }
+                else if v < -dz { s.insert(base + (vertical ? " ↑" : " ←")) }
             }
         }
         for (k, on) in buttons where on { s.insert(strip(k)) }

@@ -66,7 +66,7 @@ enum Keys {
     ]
 
     static func pretty(_ input: String) -> String {
-        if input.hasPrefix("gc:") || input.hasPrefix("hid:") {
+        if let i = input.firstIndex(of: ":"), input.distance(from: input.startIndex, to: i) <= 4 {
             return String(input.drop(while: { $0 != ":" }).dropFirst())
         }
         return input
