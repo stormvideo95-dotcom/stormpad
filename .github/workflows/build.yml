@@ -1,0 +1,24 @@
+name: Build StormPad
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app
+        run: ./build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StormPad
+          path: build/StormPad.zip
+      - name: Publish latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest -y --cleanup-tag || true
+          gh release create latest build/StormPad.zip --title "StormPad (build ${{ github.run_number }})" --notes "Download StormPad.zip, unzip, move StormPad to Applications."
